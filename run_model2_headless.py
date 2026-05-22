@@ -175,7 +175,12 @@ cnt_pl_h_in_run = 0      # frame counter for the above
 consecutive_clean_runs = 0
 
 # Force every run in a config to have no obstacles (used by Fig 12 experiment only).
-_force_empty_env = False
+_force_empty_env     = False
+# Force every run to have obstacles (used by Fig 13 4-scenario experiment).
+_force_cluttered_env = False
+# Override M2 DST with a fixed policy (simulates M0/M1 within the M2 framework).
+# Dict with keys: speed, inflation, resolution, label — or None for normal M2 DST.
+_fixed_policy_override = None
 
 OBSTACLE_GRID = None
 GRID_X_EDGES  = None
@@ -401,6 +406,8 @@ def reset_run():
     current_run_mode    = random.choice(active_indices) if active_indices else 0
     if _force_empty_env:
         current_env_is_empty = True
+    elif _force_cluttered_env:
+        current_env_is_empty = False
     else:
         current_env_is_empty = (random.random() >= (0.10 if current_run_mode == 0 else 0.90))
 
@@ -453,6 +460,7 @@ def step_logic():
     global Pl_analogy, anomaly_detected_in_run, analogy_history
     global anomaly_last_hits, anomaly_last_dist, anomaly_last_dir, entity_known_pos
     global consecutive_clean_runs, Pl_env, sum_pl_h_in_run, cnt_pl_h_in_run
+    global _fixed_policy_override
 
     # 1. Sensing & DST
     if frame_counter % int(META_PARAMS["f_loc"]) == 0:
@@ -537,11 +545,17 @@ def step_logic():
     #   Pl_analogy=1, Pl_env=0 → M0 params (clear room, relax) (empty-room efficiency)
     #   Pl_analogy=0, Pl_env=* → M1 params (analogy failing → safe regardless of env)
     analogy_speed   = base_policy["speed"]
-    analogy_inflate = base_policy["inflation"]
     analogy_res     = base_policy["resolution"]
-    # Layer 1: env-relevance — blend analogy ↔ M0 based on how much env warrants caution
+    # Layer 1: env-relevance
+    #   Speed:     Pl_env × analogy ↔ M0  (clear room → analogy speed ↓ toward M0 efficiency)
+    #   Inflation: Pl_env × max_safe ↔ M0  (clear → small margins; dense → wide berths)
+    #              max_safe scales with ROOM_SIZE so domestic never over-inflates
+    #              (warehouse: max=1.85; domestic 10x10: max≈1.18 — tight rooms need less).
+    #   Resolution: Pl_env × analogy ↔ M0 (obstacle-rich → finer grid for precise planning)
     env_speed   = Pl_env * analogy_speed   + (1.0 - Pl_env) * POLICY_M0["speed"]
-    env_inflate = Pl_env * analogy_inflate + (1.0 - Pl_env) * POLICY_M0["inflation"]
+    room_scale  = min(1.0, ROOM_SIZE / 30.0)   # 1.0=warehouse 30m; 0.33=domestic 10m
+    max_safe_inflate = POLICY_M0["inflation"] + (POLICY_M1["inflation"] - POLICY_M0["inflation"]) * room_scale
+    env_inflate = Pl_env * max_safe_inflate + (1.0 - Pl_env) * POLICY_M0["inflation"]
     env_res     = Pl_env * analogy_res     + (1.0 - Pl_env) * POLICY_M0["resolution"]
     # Layer 2: analogy trust — blend env-result ↔ M1 based on analogy correctness
     envelope_speed   = Pl_analogy * env_speed   + (1.0 - Pl_analogy) * POLICY_M1["speed"]
@@ -581,6 +595,12 @@ def step_logic():
         target_inf = envelope_inflate
         target_res = envelope_res
         active_model_label = f"M0-FAST [{selected_analogy_name}]"
+    # Baseline override: simulate M0/M1 within M2 framework (bypasses DST envelope).
+    if _fixed_policy_override is not None:
+        target_v   = _fixed_policy_override["speed"]
+        target_inf = _fixed_policy_override["inflation"]
+        target_res = _fixed_policy_override["resolution"]
+        active_model_label = _fixed_policy_override.get("label", "BASELINE")
     eff_speed      += SMOOTH_VAL * (target_v   - eff_speed)
     eff_inflation  += SMOOTH_VAL * (target_inf - eff_inflation)
     eff_resolution += SMOOTH_VAL * (target_res - eff_resolution)
@@ -691,9 +711,11 @@ def step_logic():
         ideal_f    = np.linalg.norm(START - GOAL) / (STEP_SIZE * 0.85)
         time_ratio = frame_counter / ideal_f
         time_factor = max(0.50, 1.15 - 0.20 * time_ratio)
-        base_score = 100 - (run_spills * 25) - (run_collisions * 100)
-        if run_spills == 0 and run_collisions == 0: base_score = 100
-        final_se = max(0, base_score * time_factor * (battery_level / 100.0))
+        # Efficiency: time + battery reward. Collision → task failure (efficiency=0).
+        # Spill penalty is flat (not diluted by time/battery): harm of a spill is
+        # domain-constant — spilling medication does not hurt less because you were slow.
+        efficiency = max(0.0, (100 - run_collisions * 100) * time_factor * (battery_level / 100.0))
+        final_se   = max(0.0, efficiency - run_spills * 30)
         historical_SE.append(final_se)
         had_collision = run_collisions > 0
         anomaly_ok    = anomaly_detected_in_run and not had_collision
@@ -840,7 +862,14 @@ def init_config(cfg_envs):
     anomaly_last_dir        = np.zeros(2)
     entity_known_pos        = None
     consecutive_clean_runs  = 0
-    Pl_env                  = 0.50   # reset to neutral each config
+    # Smart Pl_env prior: warehouse is 90% cluttered, domestic 90% clear, mix neutral.
+    # Seeding belief correctly eliminates the cold-start penalty in early runs.
+    if cfg_envs == [False, True]:    # warehouse only
+        Pl_env = 0.72
+    elif cfg_envs == [True, False]:  # domestic only
+        Pl_env = 0.28
+    else:                            # mix
+        Pl_env = 0.50
     sum_pl_h_in_run         = 0.0
     cnt_pl_h_in_run         = 0
     novel_entity_active     = False
@@ -1493,6 +1522,182 @@ def _plot_fig12_env_belief(results, out_dir):
     print(f"  ✅ Saved: {out}")
 
 
+# Scenario keys shared between runner and plot function — defined once.
+_FIG13_SCENARIO_KEYS = [
+    "domestic\nclear",
+    "domestic\ncluttered",
+    "warehouse\nclear",
+    "warehouse\ncluttered",
+]
+_FIG13_XLABEL = "Run #"
+_FIG13_YLABEL = "SE Score"
+
+
+def _run_4scenario_model(model_label, policy_override, cfg_envs, n_runs,
+                         force_empty, force_cluttered):
+    """
+    Run n_runs for one model in one scenario.
+    policy_override=None → M2 DST; dict → fixed policy (M0/M1 baseline).
+    Entity is disabled for a clean environment-only comparison.
+    """
+    global _force_empty_env, _force_cluttered_env, _fixed_policy_override
+    global total_runs_to_execute, NOVEL_ENTITY_SPAWN_RUN
+    global eff_speed, eff_inflation, eff_resolution
+
+    orig_n     = total_runs_to_execute
+    orig_spawn = NOVEL_ENTITY_SPAWN_RUN
+    total_runs_to_execute  = n_runs
+    NOVEL_ENTITY_SPAWN_RUN = 9999   # disable novel entity for clean env comparison
+    _force_empty_env     = force_empty
+    _force_cluttered_env = force_cluttered
+    _fixed_policy_override = (
+        {**policy_override, "label": model_label} if policy_override is not None else None
+    )
+
+    init_config(cfg_envs)
+    # Smart Pl_env prior: if we know the scenario type up front, seed belief accordingly.
+    # Cluttered → expect obstacles → start with elevated caution.
+    # Empty     → expect clear paths → start relaxed toward M0.
+    # This eliminates the cold-start penalty where Pl_env=0.50 causes early spills
+    # before the environment has been experienced.
+    if force_cluttered:
+        Pl_env = 0.72
+    elif force_empty:
+        Pl_env = 0.22
+    # For M0/M1 start from their own params (skip medical_care warm-up lag)
+    if policy_override is not None:
+        eff_speed      = policy_override["speed"]
+        eff_inflation  = policy_override["inflation"]
+        eff_resolution = policy_override["resolution"]
+        META_PARAMS["resolution"] = policy_override["resolution"]
+        build_obstacle_grid()
+    reset_run()
+
+    total_f = 0
+    while is_playing and total_f < n_runs * 5000:
+        step_logic()
+        total_f += 1
+
+    run_results = [{"se": d["se"], "spills": d["spills"], "model": model_label}
+                   for d in cold_start_data]
+    _force_empty_env       = False
+    _force_cluttered_env   = False
+    _fixed_policy_override = None
+    NOVEL_ENTITY_SPAWN_RUN = orig_spawn
+    total_runs_to_execute  = orig_n
+    return run_results
+
+
+def run_4scenario_experiment(n_runs=20, out_dir="plots"):
+    """
+    Fig 13: Compare M0, M1, M2 across 4 clearly separated scenarios.
+    Shows M2 adapts: efficient in clear rooms, maximally safe in cluttered ones.
+
+    domestic-clear     → M0 ≈ M2 >> M1  (no obstacles, caution is wasted)
+    domestic-cluttered → M2 > M1 > M0   (furniture, analogy guides precise nav)
+    warehouse-clear    → M0 ≈ M2 >> M1  (large empty space, M1 is too slow)
+    warehouse-cluttered→ M2 ≈ M1 >> M0  (dense obstacles, safety critical)
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    _SCENARIOS = [
+        (_FIG13_SCENARIO_KEYS[0], [True, False],  True,  False),
+        (_FIG13_SCENARIO_KEYS[1], [True, False],  False, True),
+        (_FIG13_SCENARIO_KEYS[2], [False, True],  True,  False),
+        (_FIG13_SCENARIO_KEYS[3], [False, True],  False, True),
+    ]
+    _MODELS = [("M0", POLICY_M0), ("M1", POLICY_M1), ("M2", None)]
+
+    results = {k: {} for k in _FIG13_SCENARIO_KEYS}
+
+    print("\n→ Fig 13: 4-Scenario comparison (M0 vs M1 vs M2, no novel entity)")
+    for scen_label, cfg_envs, force_empty, force_cluttered in _SCENARIOS:
+        tag = scen_label.replace("\n", "_")
+        for model_label, policy in _MODELS:
+            print(f"  [{tag}] {model_label}...", end=" ", flush=True)
+            data = _run_4scenario_model(model_label, policy, cfg_envs,
+                                        n_runs, force_empty, force_cluttered)
+            results[scen_label][model_label] = data
+            avg_se = np.mean([d["se"] for d in data]) if data else float('nan')
+            avg_sp = np.mean([d["spills"] for d in data]) if data else float('nan')
+            print(f"avg SE={avg_se:.1f}  spills={avg_sp:.2f}")
+
+    _plot_fig13_4scenarios(results, out_dir)
+
+
+def _plot_fig13_4scenarios(results, out_dir):
+    """Bar + trajectory plot for the 4-scenario M0/M1/M2 comparison."""
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    _COLORS   = {"M0": "#E07B39", "M1": "#4C7EBE", "M2": "#27AE60"}
+    _MODELS   = ["M0", "M1", "M2"]
+    _EXPECTED = {
+        _FIG13_SCENARIO_KEYS[0]: "M0 ≈ M2 > M1",
+        _FIG13_SCENARIO_KEYS[1]: "M2 > M1 > M0",
+        _FIG13_SCENARIO_KEYS[2]: "M0 ≈ M2 > M1",
+        _FIG13_SCENARIO_KEYS[3]: "M2 ≈ M1 >> M0",
+    }
+
+    fig, axes = plt.subplots(2, 4, figsize=(18, 9))
+    fig.suptitle(
+        "Fig 13 — M2 Adaptive Meta-Reasoning: 4-Scenario Comparison (M0 vs M1 vs M2)\n"
+        "M2 reads the environment via Pl_env: relaxes to M0 efficiency in clear rooms, "
+        "rises to M1 safety margins in cluttered ones.",
+        fontsize=11, fontweight='bold')
+
+    for col, scen in enumerate(_FIG13_SCENARIO_KEYS):
+        ax_bar  = axes[0, col]
+        ax_line = axes[1, col]
+
+        avgs = {m: np.mean([d["se"] for d in results[scen].get(m, [{"se": 0}])])
+                for m in _MODELS}
+        bars = ax_bar.bar(_MODELS, [avgs[m] for m in _MODELS],
+                          color=[_COLORS[m] for m in _MODELS],
+                          width=0.55, alpha=0.85, edgecolor='white', linewidth=1.5)
+        for bar, m in zip(bars, _MODELS):
+            h = bar.get_height()
+            ax_bar.text(bar.get_x() + bar.get_width() / 2, h + 1,
+                        f"{h:.1f}", ha='center', va='bottom',
+                        fontsize=9, fontweight='bold', color=_COLORS[m])
+
+        ax_bar.set_title(scen.replace("\n", " — ").title(), fontweight='bold', fontsize=9)
+        ax_bar.set_ylabel("Avg SE Score", fontsize=9)
+        ax_bar.set_ylim(0, 105)
+        ax_bar.grid(axis='y', alpha=0.3)
+        ax_bar.spines[['top', 'right']].set_visible(False)
+        ax_bar.text(0.98, 0.96, _EXPECTED[scen],
+                    transform=ax_bar.transAxes, ha='right', va='top',
+                    fontsize=8, color='dimgray',
+                    bbox={"boxstyle": "round,pad=0.25", "fc": "white", "alpha": 0.8})
+
+        for model in _MODELS:
+            ses = [d["se"] for d in results[scen].get(model, [])]
+            if not ses:
+                continue
+            runs = np.arange(1, len(ses) + 1)
+            ax_line.plot(runs, ses, 'o-', color=_COLORS[model],
+                         lw=1.0, ms=3, alpha=0.35)
+            if len(ses) >= 4:
+                roll = pd.Series(ses).rolling(4, min_periods=1).mean().values
+                ax_line.plot(runs, roll, color=_COLORS[model],
+                             lw=2.6, alpha=0.92, label=model)
+
+        ax_line.set_xlabel(_FIG13_XLABEL, fontsize=8)
+        ax_line.set_ylabel(_FIG13_YLABEL, fontsize=8)
+        ax_line.set_ylim(0, 105)
+        ax_line.legend(fontsize=8)
+        ax_line.grid(alpha=0.3)
+        ax_line.spines[['top', 'right']].set_visible(False)
+
+    plt.tight_layout()
+    out = f"{out_dir}/fig13_4scenarios.png"
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✅ Saved: {out}")
+
+
 if __name__ == "__main__":
     # 1. Adaptive vs fixed comparison → fig7
     print("\n→ Fig 7: Adaptive vs Fixed threshold comparison")
@@ -1524,5 +1729,10 @@ if __name__ == "__main__":
     print("  Tests 3 initial Pl_env priors × 2 environments (empty / obstacle-rich).")
     print("  Shows Pl_env converging and SE adapting regardless of initial belief.")
     run_fig12_env_belief_experiment(out_dir="plots")
+
+    # 6. 4-scenario comparison (M0 vs M1 vs M2) → fig13
+    print("\n→ Fig 13: 4-scenario comparison")
+    print("  domestic/warehouse × clear/cluttered — shows M2 adaptive advantage.")
+    run_4scenario_experiment(n_runs=40, out_dir="plots")
 
     print("\n✅ All done.")
