@@ -87,6 +87,8 @@ def present(order, found):
     return [x for x in order if x in found_set]
 
 
+NOVEL_ENTITY_SPAWN_RUN = 8   # must match headless runners
+
 def compute_run_stats(records):
     rows = []
     for r in records:
@@ -99,12 +101,19 @@ def compute_run_stats(records):
             rs      = 30.0 if mode == 'Warehouse' else 10.0
             dist    = np.sqrt(2) * (rs - 2.0)
             ideal_f = dist / (STEP_SIZE * 0.85)
-            tf      = max(0.2, 1.3 - 0.30 * frames / ideal_f)
-            bs      = 100 if (spills == 0 and cols == 0) else max(0, 100 - spills * 15 - cols * 100)
+            tf      = max(0.50, 1.15 - 0.20 * frames / ideal_f)
+            bs      = 100 if (spills == 0 and cols == 0) else max(0, 100 - spills * 25 - cols * 100)
             se      = max(0, bs * tf * battery / 100.0)
+            # Novel entity: 1 if active any frame in this run
+            has_ne_col   = 'Novel_Entity_Active' in rdf.columns
+            entity_active = int(rdf['Novel_Entity_Active'].max()) if has_ne_col else 0
+            entity_type   = str(rdf['Novel_Entity_Type'].iloc[-1]) if ('Novel_Entity_Type' in rdf.columns and has_ne_col and entity_active) else 'none'
+            analogy       = str(rdf['Analogy'].iloc[-1]) if 'Analogy' in rdf.columns else 'n/a'
             rows.append(dict(model=r['model'], config=r['config'], run=run_id,
                              mode=mode, frames=frames, battery=battery,
-                             spills=spills, collisions=cols, se=se))
+                             spills=spills, collisions=cols, se=se,
+                             entity_active=entity_active, entity_type=entity_type,
+                             analogy=analogy))
     return pd.DataFrame(rows)
 
 
@@ -521,6 +530,176 @@ def fig_efficiency(rs):
     save_fig(fig, "fig5_efficiency_variance.png")
 
 
+# ─── FIG 8: ADAPTATION CURVE ─────────────────────────────────────────────────
+def fig_adaptation(rs):
+    """SE per run before/after novel entity appears, split by model × config."""
+    if 'entity_active' not in rs.columns:
+        print("  ⓘ  No Novel_Entity_Active data — skipping fig 8.")
+        return
+    models  = present(MODEL_ORDER,  rs['model'].unique())
+    configs = present(CONFIG_ORDER, rs['config'].unique())
+    spawn   = NOVEL_ENTITY_SPAWN_RUN
+
+    fig, axes = plt.subplots(len(models), len(configs),
+                             figsize=(5 * len(configs), 4 * len(models)),
+                             sharey=True, squeeze=False)
+    fig.suptitle(
+        f"Fig 8 — Adaptation Curve: SE Before / After Novel Entity (spawns run {spawn})\n"
+        "M2 detects via analogy → recovers; M0/M1 are blind → SE drops",
+        fontsize=12, fontweight='bold')
+
+    for ri, model in enumerate(models):
+        for ci, config in enumerate(configs):
+            ax  = axes[ri][ci]
+            sub = rs[(rs['model'] == model) & (rs['config'] == config)].sort_values('run')
+            if sub.empty:
+                ax.set_visible(False); continue
+            runs = sub['run'].values
+            ses  = sub['se'].values
+            color = MODEL_COLORS.get(model, 'gray')
+            ax.plot(runs, ses, 'o-', color=color, lw=1.4, ms=4, alpha=0.5)
+            if len(ses) >= 3:
+                roll = pd.Series(ses).rolling(3, min_periods=1).mean().values
+                ax.plot(runs, roll, color=color, lw=2.5, alpha=0.9)
+            # Shade entity-active region
+            ent_runs = sub[sub['entity_active'] == 1]['run'].values
+            if len(ent_runs):
+                ax.axvspan(ent_runs[0] - 0.5, runs[-1] + 0.5,
+                           alpha=0.10, color='tomato')
+                ax.axvline(ent_runs[0] - 0.5, color='tomato', lw=1.4,
+                           linestyle='--', label='Entity appears')
+            if ri == 0:
+                ax.set_title(config.capitalize(), fontweight='bold')
+            if ci == 0:
+                ax.set_ylabel(f"{model}\nSE Score", fontsize=9)
+            ax.set_xlabel("Run #"); ax.set_ylim(0, 108)
+            ax.grid(alpha=0.3)
+            ax.spines[['top', 'right']].set_visible(False)
+            if len(ent_runs):
+                ax.legend(fontsize=7.5)
+
+    plt.tight_layout()
+    save_fig(fig, "fig8_adaptation_curve.png")
+
+
+# ─── FIG 9: SCOPE COLLAPSE / GRACEFUL DEGRADATION ────────────────────────────
+def fig_scope_collapse(rs):
+    """GDR = SE_entity / SE_pre for each model × config."""
+    if 'entity_active' not in rs.columns:
+        print("  ⓘ  No Novel_Entity_Active data — skipping fig 9.")
+        return
+    spawn   = NOVEL_ENTITY_SPAWN_RUN
+    models  = present(MODEL_ORDER,  rs['model'].unique())
+    configs = present(CONFIG_ORDER, rs['config'].unique())
+
+    rows = []
+    for model in models:
+        for config in configs:
+            sub  = rs[(rs['model'] == model) & (rs['config'] == config)]
+            pre  = sub[sub['run'] < spawn]['se'].mean()
+            post = sub[sub['entity_active'] == 1]['se'].mean()
+            gdr  = (post / pre) if (pre > 0 and not np.isnan(post)) else np.nan
+            rows.append({'model': model, 'config': config, 'pre': pre, 'post': post, 'gdr': gdr})
+    gdf = pd.DataFrame(rows).dropna(subset=['gdr'])
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig.suptitle("Fig 9 — Scope Collapse Test: Graceful Degradation Ratio (GDR = SE_entity / SE_pre)\n"
+                 "GDR=1 → no degradation | GDR<0.5 → scope collapse (red zone)",
+                 fontsize=11, fontweight='bold')
+
+    # Left: GDR bar per model (pooled across configs)
+    ax = axes[0]
+    x  = np.arange(len(models))
+    gdr_vals = [gdf[gdf['model'] == m]['gdr'].mean() for m in models]
+    bars = ax.bar(x, gdr_vals, 0.5, color=[MODEL_COLORS.get(m, 'gray') for m in models],
+                  alpha=0.88, edgecolor='white')
+    ax.axhline(1.0, color='gray',   lw=1.5, linestyle='--', label='No degradation (GDR=1)')
+    ax.axhline(0.5, color='tomato', lw=1.2, linestyle=':',  alpha=0.7, label='Collapse threshold')
+    ax.axhspan(0, 0.5, alpha=0.05, color='tomato')
+    for bar, val in zip(bars, gdr_vals):
+        if not np.isnan(val):
+            ax.text(bar.get_x() + bar.get_width()/2, val + 0.02,
+                    f'{val:.2f}', ha='center', fontsize=10, fontweight='bold')
+    ax.set_xticks(x); ax.set_xticklabels(models, fontsize=9)
+    ax.set_ylabel("GDR (higher = more graceful)"); ax.set_ylim(0, 1.4)
+    ax.set_title("GDR per Model (avg across configs)", fontweight='bold')
+    ax.legend(fontsize=9); ax.grid(axis='y', alpha=0.3)
+
+    # Right: GDR grouped by config
+    ax = axes[1]
+    bar_w = 0.22
+    xc    = np.arange(len(configs))
+    offs  = [(i - (len(models)-1)/2)*(bar_w+0.05) for i in range(len(models))]
+    for i, model in enumerate(models):
+        vals = [gdf[(gdf['model']==model) & (gdf['config']==cfg)]['gdr'].mean()
+                for cfg in configs]
+        ax.bar(xc + offs[i], vals, bar_w,
+               label=model, color=MODEL_COLORS.get(model,'gray'),
+               alpha=0.88, edgecolor='white')
+    ax.axhline(1.0, color='gray',   lw=1.5, linestyle='--')
+    ax.axhline(0.5, color='tomato', lw=1.2, linestyle=':', alpha=0.7)
+    ax.axhspan(0, 0.5, alpha=0.05, color='tomato')
+    ax.set_xticks(xc); ax.set_xticklabels([c.capitalize() for c in configs])
+    ax.set_ylabel("GDR"); ax.set_ylim(0, 1.4)
+    ax.set_title("GDR per Config × Model", fontweight='bold')
+    ax.legend(fontsize=8); ax.grid(axis='y', alpha=0.3)
+
+    plt.tight_layout()
+    save_fig(fig, "fig9_scope_collapse.png")
+
+
+# ─── FIG 10: COLD-START GAP ───────────────────────────────────────────────────
+def fig_cold_start(rs):
+    """Cold-start gap: SE drop on first entity encounter and recovery trajectory."""
+    if 'entity_active' not in rs.columns:
+        print("  ⓘ  No Novel_Entity_Active data — skipping fig 10.")
+        return
+    spawn   = NOVEL_ENTITY_SPAWN_RUN
+    models  = present(MODEL_ORDER,  rs['model'].unique())
+    configs = present(CONFIG_ORDER, rs['config'].unique())
+
+    fig, axes = plt.subplots(1, len(configs), figsize=(5.5 * len(configs), 5), sharey=True)
+    if len(configs) == 1:
+        axes = [axes]
+    fig.suptitle(
+        "Fig 10 — Cold-Start Gap: SE Drop on First Novel Entity Encounter\n"
+        "and Post-Encounter Recovery Trajectory per Model",
+        fontsize=11, fontweight='bold')
+
+    for ax, config in zip(axes, configs):
+        for model in models:
+            sub = rs[(rs['model'] == model) & (rs['config'] == config)].sort_values('run')
+            if sub.empty:
+                continue
+            color = MODEL_COLORS.get(model, 'gray')
+            pre_se = sub[sub['run'] < spawn]['se'].mean()
+            post   = sub[sub['entity_active'] == 1].sort_values('run')
+            if post.empty:
+                continue
+            ax.axhline(pre_se, color=color, lw=1.8, linestyle='--', alpha=0.6,
+                       label=f"{model} baseline ({pre_se:.1f})")
+            ax.plot(post['run'].values, post['se'].values,
+                    'o-', color=color, lw=2, ms=5, alpha=0.9)
+            if len(post) >= 3:
+                roll = pd.Series(post['se'].values).rolling(3, min_periods=1).mean().values
+                ax.plot(post['run'].values, roll, color=color, lw=3.2, alpha=0.4)
+            gap = pre_se - post['se'].iloc[0]
+            if gap > 0.5:
+                ax.annotate(f"gap={gap:.1f}",
+                            xy=(post['run'].iloc[0], post['se'].iloc[0]),
+                            xytext=(post['run'].iloc[0] + 0.6, post['se'].iloc[0] + 7),
+                            arrowprops=dict(arrowstyle='->', color=color, lw=1.1),
+                            fontsize=8, color=color)
+        ax.set_title(config.capitalize(), fontweight='bold')
+        ax.set_xlabel("Run #"); ax.set_ylabel("SE Score")
+        ax.set_ylim(0, 108); ax.grid(alpha=0.3)
+        ax.legend(fontsize=7.5)
+        ax.spines[['top', 'right']].set_visible(False)
+
+    plt.tight_layout()
+    save_fig(fig, "fig10_cold_start_gap.png")
+
+
 # ─── CONSOLE SUMMARY ─────────────────────────────────────────────────────────
 def print_summary(rs):
     print("\n" + "=" * 65)
@@ -562,6 +741,15 @@ if __name__ == '__main__':
 
     print("→ Fig 5: Efficiency & variance")
     fig_efficiency(rs)
+
+    print("→ Fig 8: Adaptation curve (novel entity)")
+    fig_adaptation(rs)
+
+    print("→ Fig 9: Scope collapse / graceful degradation")
+    fig_scope_collapse(rs)
+
+    print("→ Fig 10: Cold-start gap")
+    fig_cold_start(rs)
 
     print_summary(rs)
     print(f"\n✅ All plots saved to ./{PLOTS_DIR}/\n")

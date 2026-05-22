@@ -32,7 +32,7 @@ START     = np.array([9.0, 9.0])
 GOAL      = np.array([1.0, 1.0])
 REAL_POLY = base_poly.copy()
 
-total_runs_to_execute = 5
+total_runs_to_execute = 20
 current_run           = 1
 allowed_envs          = [True, True]
 current_run_mode      = 0
@@ -54,6 +54,14 @@ particles       = np.random.normal(START, META_PARAMS["init_uncertainty"], (40, 
 OBSTACLE_GRID = None
 GRID_X_EDGES  = None
 GRID_Y_EDGES  = None
+
+# Novel entity — M0 is completely blind to it (no detection, no avoidance)
+NOVEL_ENTITY_SPAWN_RUN = 8
+novel_entity_active  = False
+novel_entity_pos     = np.array([0.0, 0.0])
+novel_entity_radius  = 0.45
+novel_entity_type    = "unknown_cluster"
+cold_start_data      = []
 
 # ─── PURE LOGIC FUNCTIONS ────────────────────────────────────────────────────
 
@@ -112,6 +120,7 @@ def reset_run():
     global current_run_mode, current_env_is_empty, battery_level
     global run_spills, run_collisions, REAL_POLY, frames_since_spill
     global ROOM_SIZE, START, GOAL, OBSTACLE_GRID, GRID_X_EDGES, GRID_Y_EDGES
+    global novel_entity_active, novel_entity_pos, novel_entity_radius, novel_entity_type
 
     active_indices = [i for i, val in enumerate(allowed_envs) if val]
     current_run_mode     = random.choice(active_indices) if active_indices else 0
@@ -128,6 +137,16 @@ def reset_run():
     spill_events                   = []
     particles = np.random.normal(START, META_PARAMS["init_uncertainty"], (40, 2))
     frames_since_spill = SPILL_COOLDOWN_FRAMES
+    # Novel entity spawns on path — M0 never detects it
+    if current_run >= NOVEL_ENTITY_SPAWN_RUN:
+        novel_entity_active = True
+        mid = (START + GOAL) / 2.0
+        novel_entity_pos    = mid + np.array([random.uniform(-1.5, 1.5), random.uniform(-1.5, 1.5)])
+        etype               = random.choice(["unknown_cluster", "fallen_chair", "foil_lid"])
+        novel_entity_type   = etype
+        novel_entity_radius = {"unknown_cluster": 0.45, "fallen_chair": 0.30, "foil_lid": 0.15}[etype]
+    else:
+        novel_entity_active = False
     build_obstacle_grid()
 
 def step_logic():
@@ -177,6 +196,9 @@ def step_logic():
     spill_cause   = dominant_risk if spilled else "none"
 
     collision = 1 if (not current_env_is_empty and is_inside_poly(robot_pos_true, REAL_POLY)) else 0
+    # M0 is blind to the novel entity — walks right into it
+    if novel_entity_active and np.linalg.norm(robot_pos_true - novel_entity_pos) < novel_entity_radius:
+        collision = 1
     if collision: run_collisions += 1
 
     cpu_load    = min(99.8, 12.0 + (len(particles)*0.4) + (0.05/META_PARAMS["resolution"])*45 + random.uniform(-0.5, 0.5))
@@ -194,6 +216,8 @@ def step_logic():
         "Run": current_run, "Frame": frame_counter,
         "Mode": "Domestic" if current_run_mode == 0 else "Warehouse",
         "Active_Model": "M0-REACTIVE",
+        "Novel_Entity_Active": int(novel_entity_active),
+        "Novel_Entity_Type": novel_entity_type if novel_entity_active else "none",
         "Speed": round(actual_speed, 3),
         "Jerk": round(jerk_mag, 4),
         "Speed_Risk": round(speed_risk, 5), "Jerk_Risk": round(jerk_risk, 5),
@@ -208,11 +232,17 @@ def step_logic():
     if np.linalg.norm(robot_pos_true - GOAL) < META_PARAMS["goal_threshold"]:
         ideal_f    = np.linalg.norm(START - GOAL) / (STEP_SIZE * 0.85)
         time_ratio = frame_counter / ideal_f
-        time_factor = max(0.2, 1.3 - 0.30 * time_ratio)
-        base_score = 100 - (run_spills * 15) - (run_collisions * 100)
+        time_factor = max(0.50, 1.15 - 0.20 * time_ratio)
+        base_score = 100 - (run_spills * 25) - (run_collisions * 100)
         if run_spills == 0 and run_collisions == 0: base_score = 100
         final_se = max(0, base_score * time_factor * (battery_level / 100.0))
-        print(f"    run {current_run} done | SE={final_se:.1f} | spills={run_spills} | frames={frame_counter}")
+        cold_start_data.append({
+            "run": current_run, "se": final_se,
+            "entity_active": int(novel_entity_active),
+            "entity_type": novel_entity_type if novel_entity_active else "none",
+            "spills": run_spills, "collisions": run_collisions,
+        })
+        print(f"    run {current_run} done | SE={final_se:.1f} | spills={run_spills} | entity={'ON' if novel_entity_active else 'off'}")
         if current_run < total_runs_to_execute:
             current_run += 1
             reset_run()
@@ -230,8 +260,8 @@ def save_to_excel(cfg_name):
         spills, cols = int(rd['Spill'].sum()), int(rd['Collision'].sum())
         ideal_f    = np.linalg.norm(START - GOAL) / (STEP_SIZE * 0.85)
         time_ratio = len(rd) / ideal_f
-        time_factor = max(0.2, 1.3 - 0.30 * time_ratio)
-        base_safety = 100 - (spills * 15) - (cols * 100)
+        time_factor = max(0.50, 1.15 - 0.20 * time_ratio)
+        base_safety = 100 - (spills * 25) - (cols * 100)
         if spills == 0 and cols == 0: base_safety = 100
         score = max(0, base_safety * time_factor * (rd['Bat'].iloc[-1] / 100))
         run_scores.append(score)
