@@ -1,0 +1,10 @@
+# Old/broken simulation runs (pre-navigation-fix)
+model2_DST_domestic_20260521_1608.xlsx
+model2_DST_mix_20260521_1609.xlsx
+model2_DST_warehouse_20260521_1611.xlsx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
