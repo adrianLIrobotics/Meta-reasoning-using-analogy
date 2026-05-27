@@ -63,6 +63,13 @@ ANALOGY_LIBRARY = {
         "signature": np.array([0.9, 0.1]),   # [safety_attention, urgency_attention]
         "policy": {"speed": 0.58, "inflation": 1.20, "resolution": 0.04},
     },
+    "medical_care_sealed": {
+        # Lid-closed variant: same scenario but sealed container → reduced spill risk.
+        # Meta-uncertainty: robot reasons that the lid lowers urgency → slightly faster.
+        "description": "Medical delivery with sealed container — reduced urgency, still careful",
+        "signature": np.array([0.65, 0.35]),
+        "policy": {"speed": 0.62, "inflation": 1.05, "resolution": 0.05},
+    },
     "efficient_courier": {
         "description": "Time-pressured delivery in a known controlled environment",
         "signature": np.array([0.2, 0.8]),
@@ -182,6 +189,45 @@ _force_cluttered_env = False
 # Dict with keys: speed, inflation, resolution, label — or None for normal M2 DST.
 _fixed_policy_override = None
 
+# ─── TASK META-UNCERTAINTY (lid state) ───────────────────────────────────────
+# "Hot coffee is dangerous" (lid open) vs "Sealed container" (lid closed).
+# When lid is closed, spill probability is scaled down significantly, and the
+# robot can reason its way to the 'medical_care_sealed' analogy — faster but
+# still careful. The robot does NOT directly observe the lid: it infers via analogy.
+TASK_LID_CLOSED   = False   # True = cup has lid → reduced spill probability
+LID_CLOSED_FACTOR = 0.25    # p_spill × this when lid is closed
+
+# ─── SWITCHING MECHANISM (Fig 15 comparison) ─────────────────────────────────
+# "DST"       : path-cone rays only (smart — ignores irrelevant side obstacles)
+# "FULL_ROOM" : all 36 rays (naive — reacts to room-wide density, not path-specific)
+# "ATTENTION" : no Pl_analogy switching; scalar attention_weight modulates
+#               inflation/resolution continuously. If spilling despite high attention
+#               → reduce attention ('give up' on caution, accept risk).
+SWITCH_MODE      = "DST"
+attention_weight = 0.50     # legacy scalar kept for compat; ATTENTION mode now uses attn_vec
+_attn_fail_count = 0        # spill-despite-high-attention runs (triggers reduction)
+
+# ─── ATTENTIONAL VECTOR ───────────────────────────────────────────────────────
+# Replaces the scalar attention_weight with a 3-component vector:
+#   attn_vec[0] = w_speed      : how much to dampen speed (0=M0-fast, 1=M1-slow)
+#   attn_vec[1] = w_inflation  : how much to widen obstacle clearance (0=M0, 1=M1)
+#   attn_vec[2] = w_resolution : how much to sharpen path grid (0=M0-coarse, 1=M1-fine)
+# Each component is updated independently: speed-dominant spills raise w_speed;
+# jerk-dominant spills raise w_resolution (finer grid → smoother path → less jerk).
+attn_vec            = np.array([0.50, 0.50, 0.50])
+_run_speed_risk_acc = 0.0   # speed_risk accumulated this run (risk diagnosis)
+_run_jerk_risk_acc  = 0.0   # jerk_risk accumulated this run
+
+# ─── LIQUID FILL LEVEL ───────────────────────────────────────────────────────
+# Continuous probability input to spill physics. 0=empty, 1.0=full cup (maximum risk).
+# Half-full (0.5) halves p_spill vs full cup when lid is open.
+# When TASK_LID_CLOSED=True, LID_CLOSED_FACTOR overrides this (sealed container).
+LIQUID_FILL_LEVEL = 1.0   # module default: full cup, lid open
+
+# ─── AGILITY LOGGING ─────────────────────────────────────────────────────────
+_agility_log         = []   # per-run dicts for Fig 16 regime-change experiment
+_regime_schedule     = {}   # {run_number: TASK_LID_CLOSED value} — injected externally
+
 OBSTACLE_GRID = None
 GRID_X_EDGES  = None
 GRID_Y_EDGES  = None
@@ -221,6 +267,34 @@ def update_belief_dst(hits, total_rays, min_dist):
         mass_notH -= diff * (mass_notH / denom)
     pl = 1.0 - mass_notH
     return round(float(np.clip(pl, 0.0, 1.0)), 3)  # continuous, not quantized
+
+def update_belief_full_room(hits_all, total_all, min_dist):
+    """DST update using ALL 36 rays (room-wide density) instead of path-cone only.
+    Identical math to update_belief_dst but ignores whether obstacles are in the
+    robot's path — a cluttered room with a clear direct route still triggers caution.
+    This is the 'naive' baseline: smarter than a raw count but less path-aware than DST."""
+    global mass_H, mass_notH, mass_Theta
+    density_factor   = hits_all / max(1, total_all)
+    proximity_factor = max(0, 1.0 - (min_dist / META_PARAMS["laser_range"]))
+    obs_notH  = np.clip(density_factor * 0.4 + proximity_factor * 0.7, 0, 0.95)
+    loc_err   = np.linalg.norm(robot_pos_true - robot_pos_est)
+    obs_Theta = np.clip(loc_err / 1.5, 0.05, 0.6)
+    obs_H     = max(0, 1.0 - obs_notH - obs_Theta)
+    K = (mass_H * obs_notH) + (mass_notH * obs_H)
+    if K >= 1: K = 0.99
+    new_H     = (mass_H * obs_H + mass_H * obs_Theta + mass_Theta * obs_H) / (1 - K)
+    new_notH  = (mass_notH * obs_notH + mass_notH * obs_Theta + mass_Theta * obs_notH) / (1 - K)
+    new_Theta = (mass_Theta * obs_Theta) / (1 - K)
+    tot = new_H + new_notH + new_Theta
+    mass_H, mass_notH, mass_Theta = new_H/tot, new_notH/tot, new_Theta/tot
+    if mass_Theta < 0.05:
+        diff = 0.05 - mass_Theta
+        mass_Theta = 0.05
+        denom = mass_H + mass_notH + 1e-9
+        mass_H    -= diff * (mass_H    / denom)
+        mass_notH -= diff * (mass_notH / denom)
+    pl = 1.0 - mass_notH
+    return round(float(np.clip(pl, 0.0, 1.0)), 3)
 
 def ray_poly_intersection(origin, direction, poly):
     min_t = float('inf')
@@ -383,8 +457,11 @@ def reset_run():
     global selected_analogy_name, base_policy, task_profile
     global anomaly_detected_in_run, anomaly_last_hits, anomaly_last_dist, anomaly_last_dir
     global entity_known_pos, sum_pl_h_in_run, cnt_pl_h_in_run
+    global _run_speed_risk_acc, _run_jerk_risk_acc
 
     anomaly_detected_in_run = False
+    _run_speed_risk_acc = 0.0
+    _run_jerk_risk_acc  = 0.0
     anomaly_last_hits = 0
     anomaly_last_dist = float('inf')
     anomaly_last_dir  = np.zeros(2)
@@ -461,6 +538,9 @@ def step_logic():
     global anomaly_last_hits, anomaly_last_dist, anomaly_last_dir, entity_known_pos
     global consecutive_clean_runs, Pl_env, sum_pl_h_in_run, cnt_pl_h_in_run
     global _fixed_policy_override
+    global TASK_LID_CLOSED, SWITCH_MODE, attention_weight, _attn_fail_count
+    global attn_vec, _run_speed_risk_acc, _run_jerk_risk_acc, LIQUID_FILL_LEVEL
+    global _agility_log, _regime_schedule
 
     # 1. Sensing & DST
     if frame_counter % int(META_PARAMS["f_loc"]) == 0:
@@ -497,7 +577,12 @@ def step_logic():
                         anomaly_min_dist    = t_ent
                         anomaly_closest_dir = d.copy()
                     min_dist = min(min_dist, t_ent)        # also feed DST proximity
-        plausibility_H   = update_belief_dst(hits_in_path, total_rays_in_cone, min_dist)
+        # Dispatch sensing to the right belief-update mechanism
+        if SWITCH_MODE == "FULL_ROOM":
+            hits_all_rays  = sum(1 for _, t in laser_endpoints if t == "OBSTACLE")
+            plausibility_H = update_belief_full_room(hits_all_rays, 36, min_dist)
+        else:  # "DST" and "ATTENTION" both use path-cone DST for frame-level Pl_H
+            plausibility_H = update_belief_dst(hits_in_path, total_rays_in_cone, min_dist)
         # Accumulate Pl_H for per-run avg → feeds Pl_env update at end of run
         sum_pl_h_in_run += plausibility_H
         cnt_pl_h_in_run += 1
@@ -573,7 +658,18 @@ def step_logic():
     path_hazard = float(np.clip(1.0 - plausibility_H, 0.0, 1.0))
     hazard      = max(entity_prox, path_hazard * 0.7)  # entity is a sharper signal
 
-    if plausibility_H <= dynamic_threshold:
+    if SWITCH_MODE == "ATTENTION" and _fixed_policy_override is None:
+        # ATTENTION mode: probabilistic attentional vector [w_speed, w_inflation, w_resolution].
+        # Each component is updated independently from per-run spill risk diagnosis:
+        #   speed-dominant spills (speed_risk > jerk_risk) → raise w_speed more
+        #   jerk-dominant spills (tight corners, coarse path) → raise w_resolution more
+        #   inflation always responds (broader clearance helps both risk types)
+        # This decouples "I need to slow down" from "I need a smoother path".
+        target_v   = POLICY_M0["speed"]      + attn_vec[0] * (POLICY_M1["speed"]      - POLICY_M0["speed"])
+        target_inf = POLICY_M0["inflation"]  + attn_vec[1] * (POLICY_M1["inflation"]  - POLICY_M0["inflation"])
+        target_res = POLICY_M0["resolution"] + attn_vec[2] * (POLICY_M1["resolution"] - POLICY_M0["resolution"])
+        active_model_label = f"M2-ATTNv[{attn_vec[0]:.2f},{attn_vec[1]:.2f},{attn_vec[2]:.2f}]"
+    elif plausibility_H <= dynamic_threshold:
         # (d) DST hard override: path blocked → full M1 conservatism
         target_v   = POLICY_M1["speed"]
         target_inf = POLICY_M1["inflation"]
@@ -654,7 +750,13 @@ def step_logic():
     speed_risk = (actual_speed * 0.002 + actual_speed**2 * 0.001) * speed_modifier
     jerk_risk  = jerk_mag * actual_speed * 0.12 * speed_modifier
     cooldown_factor = min(1.0, frames_since_spill / SPILL_COOLDOWN_FRAMES)
-    p_spill    = (speed_risk + jerk_risk) * cooldown_factor
+    # Spill factor: sealed lid overrides fill-level; open cup risk scales with fill level
+    # (half-full cup = 0.5 × spill probability vs full cup = 1.0).
+    lid_factor = LID_CLOSED_FACTOR if TASK_LID_CLOSED else LIQUID_FILL_LEVEL
+    p_spill    = (speed_risk + jerk_risk) * cooldown_factor * lid_factor
+    # Accumulate risk per run for attentional vector diagnosis at run end
+    _run_speed_risk_acc += speed_risk
+    _run_jerk_risk_acc  += jerk_risk
     frames_since_spill += 1
     in_avoidance = 1 if np.linalg.norm(avoid_vec) > 0 else 0
     dist_obs_log = round(dist_obs, 3) if not math.isinf(dist_obs) else float('nan')
@@ -725,6 +827,50 @@ def step_logic():
         else:
             consecutive_clean_runs = max(0, consecutive_clean_runs - 2)
         update_analogy_belief(run_spills, had_collision, anomaly_ok)
+
+        # ATTENTION mode: update attentional vector from run outcomes.
+        # Spill risk diagnosis: compare accumulated speed_risk vs jerk_risk to determine
+        # which parameter to tighten most. This gives per-component attention updates
+        # rather than moving all parameters together (scalar approach).
+        if SWITCH_MODE == "ATTENTION":
+            total_risk = _run_speed_risk_acc + _run_jerk_risk_acc + 1e-9
+            speed_frac = _run_speed_risk_acc / total_risk   # 0–1: dominance of speed risk
+            jerk_frac  = _run_jerk_risk_acc  / total_risk   # 0–1: dominance of jerk risk
+            if run_spills > 0:
+                step = 0.10 * min(run_spills, 3)             # cap at 3 spills worth of step
+                # Speed component: responds to speed-dominant spills
+                attn_vec[0] = min(1.0, attn_vec[0] + step * (0.30 + 0.70 * speed_frac))
+                # Inflation: always responds — wider berths help both risk types
+                attn_vec[1] = min(1.0, attn_vec[1] + step * 0.60)
+                # Resolution component: responds to jerk-dominant spills (finer grid = smoother path)
+                attn_vec[2] = min(1.0, attn_vec[2] + step * (0.30 + 0.70 * jerk_frac))
+                if float(np.mean(attn_vec)) >= 0.70:
+                    _attn_fail_count += 1
+                if _attn_fail_count > 3:   # stuck at high attention, still spilling → reduce
+                    attn_vec[:] = np.maximum(0.10, attn_vec - 0.20)
+                    _attn_fail_count = 0
+            else:
+                _attn_fail_count = 0
+                attn_vec[:] = np.maximum(0.0, attn_vec - 0.04)   # relax all after clean run
+            attention_weight = float(np.mean(attn_vec))           # keep legacy scalar in sync
+            _run_speed_risk_acc = 0.0
+            _run_jerk_risk_acc  = 0.0
+
+        # Lid-aware analogy selection: when lid is closed, bias toward sealed variant
+        # (meta-level uncertainty — robot infers task risk from task description).
+        if TASK_LID_CLOSED and selected_analogy_name == "medical_care":
+            # Only switch if analogy belief still supports it (Pl_analogy high enough)
+            if Pl_analogy > 0.65 and _fixed_policy_override is None:
+                selected_analogy_name = "medical_care_sealed"
+                base_policy = ANALOGY_LIBRARY["medical_care_sealed"]["policy"]
+        elif not TASK_LID_CLOSED and selected_analogy_name == "medical_care_sealed":
+            selected_analogy_name = "medical_care"
+            base_policy = ANALOGY_LIBRARY["medical_care"]["policy"]
+
+        # Regime schedule: externally injected lid changes at specific run numbers
+        if (current_run + 1) in _regime_schedule:
+            TASK_LID_CLOSED = _regime_schedule[current_run + 1]
+
         # Update Pl_env from avg Pl_H this run:
         #   high avg Pl_H → path always clear → environment doesn't need the analogy's caution
         #   low  avg Pl_H → many obstacles → environment IS warranting caution → trust analogy
@@ -742,6 +888,8 @@ def step_logic():
             "spills": run_spills, "collisions": run_collisions,
             "Pl_analogy": round(Pl_analogy, 3),
             "Pl_env": round(Pl_env, 3),
+            "frames": frame_counter,
+            "battery": round(battery_level, 1),
         })
         analogy_history.append({
             "run":          current_run,
@@ -756,6 +904,15 @@ def step_logic():
         print(f"    run {current_run} done | SE={final_se:.1f} | spills={run_spills} | "
               f"Pl_a={Pl_analogy:.2f} | Pl_env={Pl_env:.2f} | analogy={selected_analogy_name} | "
               f"entity={'ON' if novel_entity_active else 'off'}")
+        _agility_log.append({
+            "run":       current_run,            "se":      final_se,
+            "spills":    run_spills,             "Pl_a":    round(Pl_analogy, 3),
+            "Pl_env":    round(Pl_env, 3),
+            "attn":      round(float(np.mean(attn_vec)), 3),   # scalar mean (plot compat)
+            "attn_v":    [round(float(x), 3) for x in attn_vec],  # full vector
+            "lid":       TASK_LID_CLOSED,        "mode":    SWITCH_MODE,
+            "eff_speed": round(eff_speed, 3),    "fill":    LIQUID_FILL_LEVEL,
+        })
         if current_run < total_runs_to_execute:
             current_run += 1
             reset_run()
@@ -838,6 +995,8 @@ def init_config(cfg_envs):
     global analogy_history, anomaly_detected_in_run
     global anomaly_last_hits, anomaly_last_dist, anomaly_last_dir, entity_known_pos
     global consecutive_clean_runs, Pl_env, sum_pl_h_in_run, cnt_pl_h_in_run
+    global attention_weight, _attn_fail_count
+    global attn_vec, _run_speed_risk_acc, _run_jerk_risk_acc
 
     historical_SE     = []
     dynamic_threshold = 0.5
@@ -876,6 +1035,14 @@ def init_config(cfg_envs):
     is_playing         = True
     prev_v_final       = np.zeros(2)
     frames_since_spill = SPILL_COOLDOWN_FRAMES
+    # Reset attention and agility state for new config
+    attention_weight    = 0.50
+    _attn_fail_count    = 0
+    attn_vec[:]         = [0.50, 0.50, 0.50]
+    _run_speed_risk_acc = 0.0
+    _run_jerk_risk_acc  = 0.0
+    _agility_log.clear()
+    _regime_schedule.clear()
     hits_in_path       = 0
 
 # ─── THRESHOLD SWEEP ─────────────────────────────────────────────────────────
@@ -1578,7 +1745,8 @@ def _run_4scenario_model(model_label, policy_override, cfg_envs, n_runs,
         step_logic()
         total_f += 1
 
-    run_results = [{"se": d["se"], "spills": d["spills"], "model": model_label}
+    run_results = [{"se": d["se"], "spills": d["spills"], "model": model_label,
+                    "frames": d.get("frames", 0), "battery": d.get("battery", 100)}
                    for d in cold_start_data]
     _force_empty_env       = False
     _force_cluttered_env   = False
@@ -1586,6 +1754,96 @@ def _run_4scenario_model(model_label, policy_override, cfg_envs, n_runs,
     NOVEL_ENTITY_SPAWN_RUN = orig_spawn
     total_runs_to_execute  = orig_n
     return run_results
+
+
+def run_fig1_overview(n_runs=40, out_dir="plots"):
+    """
+    Fig 1 — Performance Overview (M0 vs M1 vs M2, 40 runs, no novel entity).
+
+    Runs each model for n_runs in each of the 3 configs (domestic, mix, warehouse)
+    using the natural environment mix for each config (no force_empty/cluttered).
+    The entity is disabled so M2's belief has time to mature and results are clean.
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    _OVERVIEW_CONFIGS = [
+        ("domestic",  [True,  False]),
+        ("mix",       [True,  True ]),
+        ("warehouse", [False, True ]),
+    ]
+    _MODELS = [("M0", POLICY_M0), ("M1", POLICY_M1), ("M2", None)]
+
+    # results[config][model] = list of run dicts
+    results = {cfg: {} for cfg, _ in _OVERVIEW_CONFIGS}
+
+    print("\n→ Fig 1: Performance overview (40 runs, no novel entity)")
+    for cfg_name, cfg_envs in _OVERVIEW_CONFIGS:
+        for model_label, policy_override in _MODELS:
+            print(f"    {cfg_name:10s} | {model_label} …", end=" ", flush=True)
+            runs = _run_4scenario_model(
+                model_label, policy_override, cfg_envs, n_runs,
+                force_empty=False, force_cluttered=False
+            )
+            results[cfg_name][model_label] = runs
+            mean_se = np.mean([r["se"] for r in runs]) if runs else 0
+            print(f"mean SE={mean_se:.1f}")
+
+    _plot_fig1_overview(results, _OVERVIEW_CONFIGS, out_dir)
+
+
+def _plot_fig1_overview(results, configs, out_dir):
+    """4-panel grouped bar chart: SE, spills, frames, battery per model per config."""
+    cfg_names  = [c for c, _ in configs]
+    model_labels = ["M0", "M1", "M2"]
+    colors = {"M0": "#E07B39", "M1": "#4C7EBE", "M2": "#27AE60"}
+    bar_w  = 0.22
+    x      = np.arange(len(cfg_names))
+    offsets = [-bar_w - 0.03, 0, bar_w + 0.03]
+
+    metrics = [
+        ("se",      "SE Score (0–100)",        "Avg SE Score",          ".1f"),
+        ("spills",  "Spills per run",           "Avg Spills per Run",    ".2f"),
+        ("frames",  "Frames to goal",           "Avg Frames (lower=faster)", ".0f"),
+        ("battery", "Battery % remaining",      "Avg Battery at Goal",   ".1f"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+    fig.suptitle(
+        "Fig 1 — Performance Overview: M0 vs M1 vs M2\n"
+        f"(40 runs per configuration, no novel entity — clean comparison)",
+        fontsize=12, fontweight='bold')
+
+    for ax, (key, ylabel, title, fmt) in zip(axes.flat, metrics):
+        for mi, model in enumerate(model_labels):
+            vals, errs = [], []
+            for cfg in cfg_names:
+                run_list = results.get(cfg, {}).get(model, [])
+                v = [r.get(key, r.get("se", 0)) for r in run_list]
+                vals.append(np.mean(v) if v else 0)
+                errs.append(np.std(v)  if len(v) > 1 else 0)
+            bars = ax.bar(x + offsets[mi], vals, bar_w, yerr=errs, capsize=3,
+                          label=model, color=colors[model],
+                          edgecolor='white', linewidth=0.5, alpha=0.9,
+                          error_kw={'linewidth': 1.2, 'capthick': 1.2})
+            for bar, v in zip(bars, vals):
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.5,
+                        f'{v:{fmt}}', ha='center', va='bottom', fontsize=7.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels([c.capitalize() for c in cfg_names])
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontweight='bold')
+        ax.set_ylim(bottom=0)
+        ax.legend(fontsize=8)
+        ax.grid(axis='y', alpha=0.3)
+        ax.spines[['top', 'right']].set_visible(False)
+
+    plt.tight_layout()
+    out = f"{out_dir}/fig1_performance_overview.png"
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✅ Saved: {out}")
 
 
 def run_4scenario_experiment(n_runs=20, out_dir="plots"):
@@ -1698,7 +1956,682 @@ def _plot_fig13_4scenarios(results, out_dir):
     print(f"  ✅ Saved: {out}")
 
 
+# ─── HELPER: run M2 (no fixed policy) in one scenario ───────────────────────
+
+def _run_m2_scenario(n_runs, cfg_envs, force_empty=False, force_cluttered=False,
+                     switch_mode="DST", task_lid_closed=False, regime_sched=None):
+    """Run M2 with given SWITCH_MODE and initial lid state for n_runs.
+    Returns a copy of _agility_log (richer than cold_start_data — includes attn, mode, etc.)."""
+    global _force_empty_env, _force_cluttered_env, _fixed_policy_override
+    global total_runs_to_execute, NOVEL_ENTITY_SPAWN_RUN
+    global SWITCH_MODE, TASK_LID_CLOSED, _regime_schedule, Pl_env
+
+    orig_n     = total_runs_to_execute
+    orig_spawn = NOVEL_ENTITY_SPAWN_RUN
+    orig_mode  = SWITCH_MODE
+    orig_lid   = TASK_LID_CLOSED
+
+    total_runs_to_execute  = n_runs
+    NOVEL_ENTITY_SPAWN_RUN = 9999
+    _force_empty_env       = force_empty
+    _force_cluttered_env   = force_cluttered
+    _fixed_policy_override = None
+    SWITCH_MODE            = switch_mode
+    TASK_LID_CLOSED        = task_lid_closed
+
+    init_config(cfg_envs)
+    # init_config clears _regime_schedule — populate AFTER
+    if regime_sched:
+        _regime_schedule.update(regime_sched)
+    # Override Pl_env for scenario type (init_config already sets warehouse → 0.72)
+    if force_cluttered:
+        Pl_env = 0.72
+    elif force_empty:
+        Pl_env = 0.22
+    reset_run()
+
+    total_f = 0
+    while is_playing and total_f < n_runs * 5000:
+        step_logic()
+        total_f += 1
+
+    log = list(_agility_log)  # snapshot before restore
+
+    _force_empty_env       = False
+    _force_cluttered_env   = False
+    _fixed_policy_override = None
+    SWITCH_MODE            = orig_mode
+    TASK_LID_CLOSED        = orig_lid
+    NOVEL_ENTITY_SPAWN_RUN = orig_spawn
+    total_runs_to_execute  = orig_n
+    return log
+
+
+def _run_lid_model(model_label, policy_override, cfg_envs, n_runs,
+                   force_cluttered, task_lid_closed):
+    """Run one model (M0/M1/M2) with a specific lid state in one scenario.
+    Returns list of {se, spills, model}. Used by Fig 14."""
+    global _force_empty_env, _force_cluttered_env, _fixed_policy_override
+    global total_runs_to_execute, NOVEL_ENTITY_SPAWN_RUN
+    global SWITCH_MODE, TASK_LID_CLOSED, Pl_env
+    global eff_speed, eff_inflation, eff_resolution
+
+    orig_n     = total_runs_to_execute
+    orig_spawn = NOVEL_ENTITY_SPAWN_RUN
+    orig_lid   = TASK_LID_CLOSED
+    orig_mode  = SWITCH_MODE
+
+    total_runs_to_execute  = n_runs
+    NOVEL_ENTITY_SPAWN_RUN = 9999
+    _force_empty_env       = False
+    _force_cluttered_env   = force_cluttered
+    _fixed_policy_override = (
+        {**policy_override, "label": model_label} if policy_override is not None else None
+    )
+    TASK_LID_CLOSED = task_lid_closed
+    SWITCH_MODE     = "DST"  # M2 default; ignored when _fixed_policy_override is set
+
+    init_config(cfg_envs)
+    if force_cluttered:
+        Pl_env = 0.72
+    if policy_override is not None:
+        eff_speed      = policy_override["speed"]
+        eff_inflation  = policy_override["inflation"]
+        eff_resolution = policy_override["resolution"]
+        META_PARAMS["resolution"] = policy_override["resolution"]
+        build_obstacle_grid()
+    reset_run()
+
+    total_f = 0
+    while is_playing and total_f < n_runs * 5000:
+        step_logic()
+        total_f += 1
+
+    run_results = [{"se": d["se"], "spills": d["spills"], "model": model_label}
+                   for d in cold_start_data]
+
+    _force_empty_env       = False
+    _force_cluttered_env   = False
+    _fixed_policy_override = None
+    TASK_LID_CLOSED        = orig_lid
+    SWITCH_MODE            = orig_mode
+    NOVEL_ENTITY_SPAWN_RUN = orig_spawn
+    total_runs_to_execute  = orig_n
+    return run_results
+
+
+# ─── FIG 14: Lid Uncertainty ──────────────────────────────────────────────────
+
+def run_fig14_lid_uncertainty(n_runs=30, out_dir="plots"):
+    """
+    Fig 14: Task meta-uncertainty — open cup (lid open) vs sealed cup (lid closed).
+    Warehouse-cluttered, 30 runs each condition × 3 models.
+
+    M0/M1: benefit only from reduced spill physics (×0.25 lid factor), policy unchanged.
+    M2:    additionally adapts via 'medical_care_sealed' analogy — recognises lid state
+           changes the risk profile and adjusts speed/inflation/resolution.
+
+    Expected: M2 lid_closed improvement > M0/M1 lid_closed improvement, because M2
+    combines physical benefit (fewer spill events) with policy benefit (faster, still safe).
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    cfg_envs = [False, True]  # warehouse
+    _MODELS  = [("M0", POLICY_M0), ("M1", POLICY_M1), ("M2", None)]
+    _LIDS    = [("lid_open", False), ("lid_closed", True)]
+
+    results = {m: {} for m, _ in _MODELS}
+    print("\n→ Fig 14: Lid uncertainty (warehouse_cluttered, M0 vs M1 vs M2)")
+    for model_label, policy in _MODELS:
+        for lid_label, lid_val in _LIDS:
+            print(f"  [{model_label}] {lid_label}...", end=" ", flush=True)
+            data = _run_lid_model(model_label, policy, cfg_envs, n_runs,
+                                  force_cluttered=True, task_lid_closed=lid_val)
+            results[model_label][lid_label] = data
+            avg_se = np.mean([d["se"] for d in data]) if data else float('nan')
+            avg_sp = np.mean([d["spills"] for d in data]) if data else float('nan')
+            print(f"avg SE={avg_se:.1f}  spills={avg_sp:.2f}")
+
+    _plot_fig14(results, out_dir)
+
+
+def _plot_fig14(results, out_dir):
+    """3-row × 3-col plot: SE bars, SE over runs, spill bars per model."""
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    _MODELS    = ["M0", "M1", "M2"]
+    _LIDS      = ["lid_open", "lid_closed"]
+    _COLORS    = {"M0": "#E07B39", "M1": "#4C7EBE", "M2": "#27AE60"}
+    _LID_ALPHA = {"lid_open": 0.50, "lid_closed": 0.92}
+    _LID_LABEL = {"lid_open": "Lid Open", "lid_closed": "Lid Closed"}
+
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    fig.suptitle(
+        "Fig 14 — Task Meta-Uncertainty: Lid Open vs Lid Closed (Warehouse-Cluttered)\n"
+        "M2 adapts via 'medical_care_sealed' analogy (policy + physics). "
+        "M0/M1 gain spill-physics benefit only — no policy adaptation.",
+        fontsize=11, fontweight='bold')
+
+    bar_x = np.arange(2)
+    for col, m in enumerate(_MODELS):
+        ax_bar  = axes[0, col]
+        ax_line = axes[1, col]
+        ax_sp   = axes[2, col]
+
+        # Row 0: avg SE bars (open vs closed)
+        bar_se = [np.mean([d["se"] for d in results[m].get(l, [{"se": 0}])]) for l in _LIDS]
+        bars = ax_bar.bar(bar_x, bar_se, color=_COLORS[m],
+                          width=0.45, edgecolor='white', linewidth=1.5)
+        for bar, lid in zip(bars, _LIDS):
+            bar.set_alpha(_LID_ALPHA[lid])
+        for bar, v in zip(bars, bar_se):
+            ax_bar.text(bar.get_x() + bar.get_width() / 2, v + 1,
+                        f"{v:.1f}", ha='center', va='bottom',
+                        fontsize=9, fontweight='bold', color=_COLORS[m])
+        delta = bar_se[1] - bar_se[0]
+        ax_bar.text(0.97, 0.96, f"Δ={delta:+.1f}",
+                    transform=ax_bar.transAxes, ha='right', va='top',
+                    fontsize=9, color='dimgray',
+                    bbox=dict(boxstyle='round,pad=0.25', fc='white', alpha=0.8))
+        ax_bar.set_xticks(bar_x)
+        ax_bar.set_xticklabels([_LID_LABEL[l] for l in _LIDS], fontsize=9)
+        ax_bar.set_title(f"Model {m}", fontweight='bold', fontsize=10)
+        ax_bar.set_ylabel("Avg SE Score", fontsize=9)
+        ax_bar.set_ylim(0, 105)
+        ax_bar.grid(axis='y', alpha=0.3)
+        ax_bar.spines[['top', 'right']].set_visible(False)
+
+        # Row 1: SE over runs (raw + rolling mean)
+        for lid in _LIDS:
+            ses = [d["se"] for d in results[m].get(lid, [])]
+            if not ses:
+                continue
+            runs = np.arange(1, len(ses) + 1)
+            ax_line.plot(runs, ses, 'o-', color=_COLORS[m],
+                         alpha=_LID_ALPHA[lid] * 0.45, lw=0.8, ms=3)
+            roll = pd.Series(ses).rolling(4, min_periods=1).mean().values
+            ax_line.plot(runs, roll, color=_COLORS[m], lw=2.5,
+                         alpha=_LID_ALPHA[lid], label=_LID_LABEL[lid])
+        ax_line.set_xlabel("Run #", fontsize=8)
+        ax_line.set_ylabel("SE Score", fontsize=8)
+        ax_line.set_ylim(0, 105)
+        ax_line.legend(fontsize=8)
+        ax_line.grid(alpha=0.3)
+        ax_line.spines[['top', 'right']].set_visible(False)
+
+        # Row 2: avg spills/run bars
+        bar_sp = [np.mean([d["spills"] for d in results[m].get(l, [{"spills": 0}])]) for l in _LIDS]
+        bars2 = ax_sp.bar(bar_x, bar_sp, color=_COLORS[m],
+                          width=0.45, edgecolor='white', linewidth=1.5)
+        for bar, lid in zip(bars2, _LIDS):
+            bar.set_alpha(_LID_ALPHA[lid])
+        for bar, v in zip(bars2, bar_sp):
+            ax_sp.text(bar.get_x() + bar.get_width() / 2, v + 0.02,
+                       f"{v:.2f}", ha='center', va='bottom',
+                       fontsize=9, fontweight='bold', color=_COLORS[m])
+        ax_sp.set_xticks(bar_x)
+        ax_sp.set_xticklabels([_LID_LABEL[l] for l in _LIDS], fontsize=9)
+        ax_sp.set_ylabel("Avg Spills / Run", fontsize=9)
+        ax_sp.set_ylim(0, max(max(bar_sp), 0.1) * 1.5)
+        ax_sp.grid(axis='y', alpha=0.3)
+        ax_sp.spines[['top', 'right']].set_visible(False)
+
+    plt.tight_layout()
+    out = f"{out_dir}/fig14_lid_uncertainty.png"
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✅ Saved: {out}")
+
+
+# ─── FIG 15: Switching Mechanism Comparison ───────────────────────────────────
+
+def run_fig15_switching_comparison(n_runs=40, out_dir="plots"):
+    """
+    Fig 15: DST (path-cone) vs FULL_ROOM (all 36 rays) vs ATTENTION (scalar weight).
+    All run M2 in warehouse_cluttered, lid_open, no regime change.
+
+    DST: only samples rays in the forward 70° cone toward goal — ignores side clutter.
+         Smart: a cluttered room with clear path = low obstacle density in cone = trust analogy.
+    FULL_ROOM: samples all 36 rays — reacts to ambient room density.
+         Naive: even when path is clear, dense side walls trigger extra caution → slower SE.
+    ATTENTION: no hard policy switch. A single scalar (0=M0-like, 1=M1-like) modulates
+         inflation continuously. If spilling despite high attention → reduce weight (give up).
+
+    Expected ranking: DST > FULL_ROOM ≥ ATTENTION (path-awareness is the key differentiator).
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    cfg_envs = [False, True]
+    _MODES   = ["DST", "FULL_ROOM", "ATTENTION"]
+
+    results = {}
+    print("\n→ Fig 15: Switching comparison (warehouse_cluttered, M2, lid_open)")
+    for mode in _MODES:
+        print(f"  [{mode}]...", end=" ", flush=True)
+        log = _run_m2_scenario(n_runs, cfg_envs, force_cluttered=True,
+                               switch_mode=mode, task_lid_closed=False)
+        results[mode] = log
+        avg_se = np.mean([e["se"] for e in log]) if log else float('nan')
+        avg_sp = np.mean([e["spills"] for e in log]) if log else float('nan')
+        print(f"avg SE={avg_se:.1f}  spills={avg_sp:.2f}")
+
+    _plot_fig15(results, out_dir)
+
+
+def _plot_fig15(results, out_dir):
+    """3-panel vertical: SE over runs · Pl_analogy/attention trace · cumulative spills."""
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    _MODES  = ["DST", "FULL_ROOM", "ATTENTION"]
+    _COLORS = {"DST": "#27AE60", "FULL_ROOM": "#E07B39", "ATTENTION": "#7B68EE"}
+    _LABELS = {
+        "DST":       "DST (path-cone, smart)",
+        "FULL_ROOM": "Full-Room (all rays, naive)",
+        "ATTENTION": "Attention scalar (no switch)",
+    }
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 13))
+    fig.suptitle(
+        "Fig 15 — Switching Mechanism Comparison: DST vs Full-Room vs Attention\n"
+        "DST reasons over path-relevant obstacles only. "
+        "Full-Room reacts to ambient room density. "
+        "Attention modulates inflation continuously without hard policy switching.",
+        fontsize=10, fontweight='bold')
+
+    ax_se, ax_pl, ax_cum = axes
+
+    for mode in _MODES:
+        log    = results.get(mode, [])
+        runs   = [e["run"] for e in log]
+        ses    = [e["se"] for e in log]
+        spills_cum = np.cumsum([e["spills"] for e in log]).tolist()
+        # Pl_analogy for DST/FULL_ROOM; attention_weight for ATTENTION
+        pl_vals = [e["Pl_a"] if mode != "ATTENTION" else e["attn"] for e in log]
+
+        c = _COLORS[mode]
+        lbl = _LABELS[mode]
+
+        ax_se.plot(runs, ses, 'o-', color=c, alpha=0.20, lw=0.8, ms=3)
+        if len(ses) >= 4:
+            roll = pd.Series(ses).rolling(4, min_periods=1).mean().values
+            ax_se.plot(runs, roll, color=c, lw=2.6, alpha=0.95, label=lbl)
+        else:
+            ax_se.plot(runs, ses, color=c, lw=2.0, label=lbl)
+
+        ax_pl.plot(runs, pl_vals, '-', color=c, lw=2.0, alpha=0.90, label=lbl)
+        ax_cum.plot(runs, spills_cum, '-', color=c, lw=2.4, alpha=0.90, label=lbl)
+
+    ax_se.set_ylabel("SE Score (rolling-4 mean)", fontsize=10)
+    ax_se.set_ylim(0, 105)
+    ax_se.legend(fontsize=9)
+    ax_se.grid(alpha=0.3)
+    ax_se.spines[['top', 'right']].set_visible(False)
+
+    ax_pl.set_ylabel("Pl_analogy / attention weight", fontsize=10)
+    ax_pl.set_ylim(-0.05, 1.10)
+    ax_pl.axhline(0.5, color='gray', lw=0.8, linestyle='--', alpha=0.5,
+                  label="switch threshold (DST/FULL_ROOM)")
+    ax_pl.legend(fontsize=9)
+    ax_pl.grid(alpha=0.3)
+    ax_pl.spines[['top', 'right']].set_visible(False)
+
+    ax_cum.set_xlabel("Run #", fontsize=10)
+    ax_cum.set_ylabel("Cumulative Spills", fontsize=10)
+    ax_cum.legend(fontsize=9)
+    ax_cum.grid(alpha=0.3)
+    ax_cum.spines[['top', 'right']].set_visible(False)
+
+    plt.tight_layout()
+    out = f"{out_dir}/fig15_switching.png"
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✅ Saved: {out}")
+
+
+# ─── FIG 16: Agility Metrics Under Regime Change ──────────────────────────────
+
+def _compute_reaction_latency(ses, change_idx, n_per_phase):
+    """Runs after change_idx (0-indexed) until rolling-3 mean reaches 90% of phase steady-state.
+    steady-state = mean of last 3 runs in destination phase."""
+    phase_end  = change_idx + n_per_phase
+    dest_ses   = ses[change_idx: min(phase_end, len(ses))]
+    if len(dest_ses) < 3:
+        return n_per_phase
+    steady = np.mean(dest_ses[-3:])
+    for k in range(len(dest_ses) - 2):
+        window = np.mean(dest_ses[k: k + 3])
+        if steady > 5 and window >= 0.90 * steady:
+            return k + 1
+    return n_per_phase  # never recovered within phase
+
+
+def _compute_sample_efficiency(log, threshold=0.75):
+    """Runs until Pl_analogy first crosses threshold for 3 consecutive runs.
+    For ATTENTION mode (no Pl_a), uses attn_vec norm stability instead.
+    Returns n_per_phase if never achieved within the log."""
+    pla_vals = [e["Pl_a"] for e in log]
+    if all(v == 0 for v in pla_vals):
+        # ATTENTION mode: stable when attn mean changes < 0.05 over 3 consecutive runs
+        attn_vals = [e["attn"] for e in log]
+        for k in range(2, len(attn_vals)):
+            if max(attn_vals[k-2:k+1]) - min(attn_vals[k-2:k+1]) < 0.05:
+                return k + 1
+        return len(log)
+    for k in range(2, len(pla_vals)):
+        if all(v >= threshold for v in pla_vals[k-2: k+1]):
+            return k + 1
+    return len(log)
+
+
+def run_fig16_agility_metrics(n_per_phase=15, out_dir="plots"):
+    """
+    Fig 16: Agility of each switching mechanism under two regime changes.
+    Phase 1 (runs 1..n): lid_open  →  Phase 2 (n+1..2n): lid_closed  →  Phase 3 (2n+1..3n): lid_open.
+
+    Measures:
+      Reaction latency : runs until rolling-3 SE recovers to 90% of destination-phase steady-state.
+      Behavior stability: SE std dev within each phase (after 3-run warm-up).
+      SE trace         : 3n-run performance curve with regime change markers.
+
+    DST expected fastest: path-cone update immediately sees reduced obstacle density
+    in the sealed-lid phase → analogy shifts to medical_care_sealed within 2-3 runs.
+    ATTENTION expected slowest: scalar weight updates are conservative (+0.12/spill)
+    so require more evidence before crossing the high-attention regime.
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    total_runs = 3 * n_per_phase
+    cfg_envs   = [False, True]  # warehouse
+    regime     = {n_per_phase + 1: True, 2 * n_per_phase + 1: False}
+    _MODES     = ["DST", "FULL_ROOM", "ATTENTION"]
+
+    results = {}
+    print(f"\n→ Fig 16: Agility metrics — {n_per_phase} runs × 3 phases per mechanism")
+    for mode in _MODES:
+        print(f"  [{mode}]...", end=" ", flush=True)
+        log = _run_m2_scenario(total_runs, cfg_envs, force_cluttered=True,
+                               switch_mode=mode, task_lid_closed=False,
+                               regime_sched=regime)
+        results[mode] = log
+        avg_se = np.mean([e["se"] for e in log]) if log else float('nan')
+        print(f"avg SE={avg_se:.1f}  ({len(log)} runs logged)")
+
+    _plot_fig16(results, out_dir, n_per_phase)
+
+
+def _plot_fig16(results, out_dir, n_per_phase):
+    """4-panel: SE trace · reaction latency · sample efficiency · behavior stability."""
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    _MODES  = ["DST", "FULL_ROOM", "ATTENTION"]
+    _COLORS = {"DST": "#27AE60", "FULL_ROOM": "#E07B39", "ATTENTION": "#7B68EE"}
+    _LABELS = {"DST": "DST (path-cone)", "FULL_ROOM": "Full-Room", "ATTENTION": "Attn Vector"}
+
+    fig, axes = plt.subplots(4, 1, figsize=(13, 19))
+    fig.suptitle(
+        "Fig 16 — Agility Metrics Under Regime Change\n"
+        f"Phase 1 (runs 1–{n_per_phase}): lid open  →  "
+        f"Phase 2 ({n_per_phase+1}–{2*n_per_phase}): lid closed  →  "
+        f"Phase 3 ({2*n_per_phase+1}–{3*n_per_phase}): lid open",
+        fontsize=10, fontweight='bold')
+
+    ax_se, ax_lat, ax_seff, ax_std = axes
+
+    change_idxs    = [n_per_phase, 2 * n_per_phase]
+    latencies      = {m: [] for m in _MODES}
+    stabilities    = {m: [] for m in _MODES}
+    sample_effs    = {m: 0   for m in _MODES}
+
+    for mode in _MODES:
+        log   = results.get(mode, [])
+        runs  = list(range(1, len(log) + 1))
+        ses   = [e["se"] for e in log]
+        c     = _COLORS[mode]
+        lbl   = _LABELS[mode]
+
+        # SE trace
+        ax_se.plot(runs, ses, 'o-', color=c, alpha=0.18, lw=0.8, ms=3)
+        if len(ses) >= 4:
+            roll = pd.Series(ses).rolling(4, min_periods=1).mean().values
+            ax_se.plot(runs, roll, color=c, lw=2.5, alpha=0.95, label=lbl)
+        else:
+            ax_se.plot(runs, ses, color=c, lw=2.0, label=lbl)
+
+        # Reaction latency per regime change
+        for cp in change_idxs:
+            lat = _compute_reaction_latency(ses, cp, n_per_phase)
+            latencies[mode].append(lat)
+
+        # Sample efficiency: runs until stable belief (Pl_a ≥ 0.75 for 3 consecutive runs)
+        sample_effs[mode] = _compute_sample_efficiency(log, threshold=0.75)
+
+        # Behavior stability: SE std in each phase (skip first 3 runs)
+        for start in [0, n_per_phase, 2 * n_per_phase]:
+            ph_ses = ses[start + 3: start + n_per_phase] if start + 3 < len(ses) else []
+            stabilities[mode].append(np.std(ph_ses) if len(ph_ses) >= 2 else float('nan'))
+
+    # ── Panel 1: SE trace ──
+    for cp in change_idxs:
+        ax_se.axvline(cp + 0.5, color='gray', lw=1.5, linestyle='--', alpha=0.6)
+    ax_se.axvspan(n_per_phase, 2 * n_per_phase, alpha=0.07, color='steelblue',
+                  label=f"lid closed (runs {n_per_phase+1}–{2*n_per_phase})")
+    ax_se.set_ylabel("SE Score (rolling-4 mean)", fontsize=10)
+    ax_se.set_ylim(0, 105)
+    ax_se.legend(fontsize=9, loc='lower right')
+    ax_se.grid(alpha=0.3)
+    ax_se.spines[['top', 'right']].set_visible(False)
+    ax_se.set_title("SE trace over all phases (dashed = regime change)", fontsize=9, pad=4)
+
+    # ── Panel 2: Reaction latency ──
+    x  = np.arange(len(_MODES))
+    w  = 0.30
+    change_labels = [
+        f"open→closed\n(run {n_per_phase + 1})",
+        f"closed→open\n(run {2 * n_per_phase + 1})",
+    ]
+    for ph_i, (ch_lbl, alpha) in enumerate(zip(change_labels, [0.60, 0.95])):
+        vals = [latencies[m][ph_i] for m in _MODES]
+        bars = ax_lat.bar(x + (ph_i - 0.5) * w, vals, width=w,
+                          color=[_COLORS[m] for m in _MODES], alpha=alpha,
+                          edgecolor='white', linewidth=1.2, label=ch_lbl)
+        for bar, v in zip(bars, vals):
+            ax_lat.text(bar.get_x() + bar.get_width() / 2, v + 0.15,
+                        str(int(v)), ha='center', va='bottom',
+                        fontsize=9, fontweight='bold')
+    ax_lat.set_xticks(x)
+    ax_lat.set_xticklabels([_LABELS[m] for m in _MODES], fontsize=9)
+    ax_lat.set_ylabel("Reaction Latency (runs)", fontsize=10)
+    ax_lat.set_ylim(0, n_per_phase + 2)
+    ax_lat.legend(fontsize=9)
+    ax_lat.grid(axis='y', alpha=0.3)
+    ax_lat.spines[['top', 'right']].set_visible(False)
+    ax_lat.set_title(
+        "Reaction Latency per Regime Change  (lower = faster adaptation)", fontsize=9, pad=4)
+
+    # ── Panel 3: Sample efficiency ──
+    se_vals = [sample_effs[m] for m in _MODES]
+    bars3   = ax_seff.bar(x, se_vals, color=[_COLORS[m] for m in _MODES],
+                          width=0.45, edgecolor='white', linewidth=1.5, alpha=0.88)
+    for bar, v in zip(bars3, se_vals):
+        ax_seff.text(bar.get_x() + bar.get_width() / 2, v + 0.2,
+                     str(int(v)), ha='center', va='bottom',
+                     fontsize=10, fontweight='bold')
+    ax_seff.set_xticks(x)
+    ax_seff.set_xticklabels([_LABELS[m] for m in _MODES], fontsize=9)
+    ax_seff.set_ylabel("Runs to Stable Belief (lower = more efficient)", fontsize=10)
+    ax_seff.set_ylim(0, 3 * n_per_phase + 2)
+    ax_seff.grid(axis='y', alpha=0.3)
+    ax_seff.spines[['top', 'right']].set_visible(False)
+    ax_seff.set_title(
+        "Sample Efficiency  (runs until Pl_analogy ≥ 0.75 for 3 consecutive runs)", fontsize=9, pad=4)
+
+    # ── Panel 4: Behavior stability ──
+    x3   = np.arange(len(_MODES))
+    w3   = 0.22
+    ph_names  = ["Ph1\nopen", "Ph2\nclosed", "Ph3\nopen"]
+    ph_alphas = [0.50, 0.95, 0.70]
+    for ph_i, (ph_name, ph_alpha) in enumerate(zip(ph_names, ph_alphas)):
+        for mi, m in enumerate(_MODES):
+            v = stabilities[m][ph_i]
+            lbl_bar = ph_name if mi == 0 else ""
+            if not np.isnan(v):
+                ax_std.bar(x3[mi] + (ph_i - 1) * w3, v, width=w3,
+                           color=_COLORS[m], alpha=ph_alpha,
+                           edgecolor='white', linewidth=1.2, label=lbl_bar)
+                ax_std.text(x3[mi] + (ph_i - 1) * w3, v + 0.3,
+                            f"{v:.1f}", ha='center', va='bottom', fontsize=8)
+    ax_std.set_xticks(x3)
+    ax_std.set_xticklabels([_LABELS[m] for m in _MODES], fontsize=9)
+    ax_std.set_ylabel("SE Std Dev (lower = more stable)", fontsize=10)
+    ax_std.set_xlabel("Switching Mechanism", fontsize=10)
+    ax_std.legend(fontsize=9, title="Phase")
+    ax_std.grid(axis='y', alpha=0.3)
+    ax_std.spines[['top', 'right']].set_visible(False)
+    ax_std.set_title(
+        "Behavior Stability per Phase  (SE std dev, first 3 runs excluded as warm-up)",
+        fontsize=9, pad=4)
+
+    plt.tight_layout()
+    out = f"{out_dir}/fig16_agility.png"
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✅ Saved: {out}")
+
+
+# ─── FIG 17: Fill-Level Sweep ────────────────────────────────────────────────
+
+def run_fig17_fill_level(n_runs=20, out_dir="plots"):
+    """
+    Fig 17: How does liquid fill level (0.25 → 1.0) affect SE and spill rate per model?
+    Models M0, M1, M2 × fill levels [0.25, 0.50, 0.75, 1.0] in warehouse-cluttered.
+    TASK_LID_CLOSED=False throughout (open cup scenario).
+
+    Insight expected:
+      M0: steep SE degradation as fill rises (high jerk, lots of spill events).
+      M1: gradual degradation (slow+wide margins, low jerk even when full).
+      M2: moderate degradation but mitigated — analogy policy's finer resolution
+          reduces jerk so the higher fill-level spill probability fires less often.
+    """
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    global LIQUID_FILL_LEVEL, TASK_LID_CLOSED
+    _FILLS  = [0.25, 0.50, 0.75, 1.00]
+    _MODELS = [
+        ("M0", {"speed": POLICY_M0["speed"], "inflation": POLICY_M0["inflation"],
+                "resolution": POLICY_M0["resolution"], "label": "M0-Reactive"}),
+        ("M1", {"speed": POLICY_M1["speed"], "inflation": POLICY_M1["inflation"],
+                "resolution": POLICY_M1["resolution"], "label": "M1-Symbolic"}),
+        ("M2", None),
+    ]
+    cfg_envs = [False, True]   # warehouse
+
+    print(f"\n→ Fig 17: Fill-level sweep — {len(_FILLS)} levels × 3 models × {n_runs} runs")
+
+    results = {m: {"se": [], "spills": []} for m, _ in _MODELS}
+
+    orig_fill = LIQUID_FILL_LEVEL
+    orig_lid  = TASK_LID_CLOSED
+
+    for fill in _FILLS:
+        LIQUID_FILL_LEVEL = fill
+        TASK_LID_CLOSED   = False
+        for model_label, policy_override in _MODELS:
+            global _force_empty_env, _force_cluttered_env, _fixed_policy_override
+            global total_runs_to_execute
+            _force_empty_env     = False
+            _force_cluttered_env = True
+            _fixed_policy_override = policy_override
+            total_runs_to_execute  = n_runs
+            init_config(cfg_envs)
+            reset_run()
+            frame_count = 0
+            while is_playing and frame_count < 60_000:
+                step_logic()
+                frame_count += 1
+            run_ses    = [d["se"]     for d in cold_start_data]
+            run_spills = [d["spills"] for d in cold_start_data]
+            results[model_label]["se"].append(np.mean(run_ses)    if run_ses    else float('nan'))
+            results[model_label]["spills"].append(np.mean(run_spills) if run_spills else float('nan'))
+            print(f"    fill={fill:.2f}  {model_label}:  SE={results[model_label]['se'][-1]:.1f}  "
+                  f"spills/run={results[model_label]['spills'][-1]:.2f}")
+
+    LIQUID_FILL_LEVEL  = orig_fill
+    TASK_LID_CLOSED    = orig_lid
+    _fixed_policy_override = None
+    _force_cluttered_env   = False
+    _plot_fig17(results, _FILLS, out_dir)
+
+
+def _plot_fig17(results, fills, out_dir):
+    """2-panel: SE vs fill level (left) · spills/run vs fill level (right)."""
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+
+    _COLORS = {"M0": "#E74C3C", "M1": "#3498DB", "M2": "#27AE60"}
+    _LABELS = {"M0": "M0-Reactive", "M1": "M1-Symbolic", "M2": "M2-DST"}
+    _MARKERS = {"M0": "s", "M1": "^", "M2": "o"}
+    fill_pct = [int(f * 100) for f in fills]
+
+    fig, (ax_se, ax_sp) = plt.subplots(1, 2, figsize=(13, 6))
+    fig.suptitle(
+        "Fig 17 — Liquid Fill Level vs Performance  (warehouse-cluttered, lid open, 20 runs/point)\n"
+        "Fill level = 0.25 (quarter-full) → 1.0 (brimming) — scales p_spill continuously",
+        fontsize=10, fontweight='bold')
+
+    for model in ["M0", "M1", "M2"]:
+        se_vals = results[model]["se"]
+        sp_vals = results[model]["spills"]
+        c, lbl, mk = _COLORS[model], _LABELS[model], _MARKERS[model]
+        ax_se.plot(fill_pct, se_vals, mk + '-', color=c, lw=2.2, ms=8, label=lbl)
+        for x, y in zip(fill_pct, se_vals):
+            ax_se.annotate(f"{y:.1f}", (x, y), textcoords="offset points",
+                           xytext=(0, 8), ha='center', fontsize=8, color=c)
+        ax_sp.plot(fill_pct, sp_vals, mk + '-', color=c, lw=2.2, ms=8, label=lbl)
+        for x, y in zip(fill_pct, sp_vals):
+            ax_sp.annotate(f"{y:.2f}", (x, y), textcoords="offset points",
+                           xytext=(0, 8), ha='center', fontsize=8, color=c)
+
+    ax_se.axvline(50, color='gray', linestyle=':', alpha=0.5, label="half-full (50%)")
+    ax_sp.axvline(50, color='gray', linestyle=':', alpha=0.5, label="half-full (50%)")
+
+    ax_se.set_xlabel("Liquid Fill Level (%)", fontsize=10)
+    ax_se.set_ylabel("Average SE Score", fontsize=10)
+    ax_se.set_xticks(fill_pct)
+    ax_se.set_ylim(0, 100)
+    ax_se.legend(fontsize=9)
+    ax_se.grid(alpha=0.3)
+    ax_se.spines[['top', 'right']].set_visible(False)
+    ax_se.set_title("Safety-Efficiency vs Fill Level", fontsize=9, pad=4)
+
+    ax_sp.set_xlabel("Liquid Fill Level (%)", fontsize=10)
+    ax_sp.set_ylabel("Spills per Run", fontsize=10)
+    ax_sp.set_xticks(fill_pct)
+    ax_sp.set_ylim(0, max(
+        max(results[m]["spills"], default=0) for m in ["M0","M1","M2"]
+    ) * 1.25 + 0.3)
+    ax_sp.legend(fontsize=9)
+    ax_sp.grid(alpha=0.3)
+    ax_sp.spines[['top', 'right']].set_visible(False)
+    ax_sp.set_title("Spills per Run vs Fill Level", fontsize=9, pad=4)
+
+    plt.tight_layout()
+    out = f"{out_dir}/fig17_fill_level.png"
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  ✅ Saved: {out}")
+
+
 if __name__ == "__main__":
+    # 0. Performance overview (M0 vs M1 vs M2, 40 runs, no entity) → fig1
+    run_fig1_overview(n_runs=40)
+
     # 1. Adaptive vs fixed comparison → fig7
     print("\n→ Fig 7: Adaptive vs Fixed threshold comparison")
     compare_adaptive_vs_fixed(n_runs=20)
@@ -1734,5 +2667,25 @@ if __name__ == "__main__":
     print("\n→ Fig 13: 4-scenario comparison")
     print("  domestic/warehouse × clear/cluttered — shows M2 adaptive advantage.")
     run_4scenario_experiment(n_runs=40, out_dir="plots")
+
+    # 7. Lid uncertainty (open vs closed cup) → fig14
+    print("\n→ Fig 14: Task meta-uncertainty — lid open vs lid closed")
+    print("  M2 adapts via medical_care_sealed analogy + physics. M0/M1 physics only.")
+    run_fig14_lid_uncertainty(n_runs=30, out_dir="plots")
+
+    # 8. Switching mechanism comparison → fig15
+    print("\n→ Fig 15: DST vs Full-Room vs Attention switching (warehouse_cluttered)")
+    print("  DST: path-cone only (smart). FULL_ROOM: all 36 rays (naive). ATTENTION: scalar weight.")
+    run_fig15_switching_comparison(n_runs=40, out_dir="plots")
+
+    # 9. Agility metrics under regime change → fig16
+    print("\n→ Fig 16: Agility under regime change (3 × 15 runs, lid_open → closed → open)")
+    print("  Measures reaction latency, sample efficiency, behavior stability, SE trace.")
+    run_fig16_agility_metrics(n_per_phase=15, out_dir="plots")
+
+    # 10. Fill-level sweep → fig17
+    print("\n→ Fig 17: Liquid fill-level sweep (0.25 → 1.0) — continuous spill probability")
+    print("  Shows M2's path-smoothness advantage under increasing open-cup risk.")
+    run_fig17_fill_level(n_runs=20, out_dir="plots")
 
     print("\n✅ All done.")

@@ -397,12 +397,13 @@ def fig_dst_dynamics(records):
         if 'Active_Model' not in cdf.columns:
             m0_frac.append(50); m1_frac.append(50)
             continue
-        m0 = cdf['Active_Model'].str.contains('REACTIVE', na=False).mean() * 100
+        # Active_Model values: 'M0-FAST [analogy]' or 'M1-SAFE [analogy]'
+        m0 = cdf['Active_Model'].str.contains('M0-FAST|REACTIVE', na=False).mean() * 100
         m0_frac.append(m0); m1_frac.append(100 - m0)
     x = np.arange(len(configs))
-    b0 = ax.bar(x, m0_frac, 0.5, label='M0-REACTIVE (fast)',
+    b0 = ax.bar(x, m0_frac, 0.5, label='M0-FAST mode (path clear)',
                 color=MODEL_COLORS['M0-Reactive'], alpha=0.85, edgecolor='white')
-    b1 = ax.bar(x, m1_frac, 0.5, bottom=m0_frac, label='M1-SYMBOLIC (safe)',
+    b1 = ax.bar(x, m1_frac, 0.5, bottom=m0_frac, label='M1-SAFE mode (hazard/uncertainty)',
                 color=MODEL_COLORS['M1-Symbolic'], alpha=0.85, edgecolor='white')
     for i, (m0v, m1v) in enumerate(zip(m0_frac, m1_frac)):
         if m0v > 8:
